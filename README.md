@@ -1,6 +1,6 @@
 # Loop Fivetran Connector
 
-Fivetran SDK connector for syncing Loop subscription data.
+Fivetran SDK connector for syncing Loop subscription data for [loopwork.co](loopwork.co)
 
 ## Overview
 
