@@ -613,16 +613,46 @@ def _get_api_page(
     if _loop_client is None:
         return {}
 
-    try:
-        url = f"{endpoint}?pageNo={page}&pageSize=1000&{date_param_prefix}StartEpoch={start_epoch}&{date_param_prefix}EndEpoch={end_epoch}"
-        response = _loop_client.get(url, timeout=30)
-        response.raise_for_status()
-        result: dict[str, Any] = response.json()  # type: ignore[assignment]
-        return result
-    except Exception as e:
-        # Log error but don't fail the entire sync
-        print(f"Error fetching {endpoint} page {page}: {e}")
-        return {}
+    url = f"{endpoint}?pageNo={page}&pageSize=1000&{date_param_prefix}StartEpoch={start_epoch}&{date_param_prefix}EndEpoch={end_epoch}"
+    max_retries = 3
+    
+    for attempt in range(max_retries):
+        try:
+            response = _loop_client.get(url, timeout=30)
+            
+            # Handle 429 rate limiting with retry
+            if response.status_code == 429:
+                if attempt < max_retries - 1:
+                    # Wait about a second before retrying
+                    time.sleep(1.0)
+                    continue
+                else:
+                    # Last attempt, log and return empty
+                    print(f"Rate limited (429) fetching {endpoint} page {page} after {max_retries} attempts")
+                    return {}
+            
+            response.raise_for_status()
+            result: dict[str, Any] = response.json()  # type: ignore[assignment]
+            return result
+        except requests.HTTPError as e:
+            # Check if it's a 429 error from raise_for_status()
+            if hasattr(e, 'response') and e.response is not None and e.response.status_code == 429:
+                if attempt < max_retries - 1:
+                    time.sleep(1.0)
+                    continue
+                else:
+                    print(f"Rate limited (429) fetching {endpoint} page {page} after {max_retries} attempts")
+                    return {}
+            # For other HTTP errors, log and return empty
+            print(f"Error fetching {endpoint} page {page}: {e}")
+            return {}
+        except Exception as e:
+            # Log error but don't fail the entire sync
+            print(f"Error fetching {endpoint} page {page}: {e}")
+            return {}
+    
+    # Should never reach here, but return empty dict as fallback
+    return {}
 
 
 def _get_subscriptions_page(
