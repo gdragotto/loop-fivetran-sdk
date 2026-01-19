@@ -16,7 +16,7 @@ from typing import Any, Optional
 
 import requests
 
-from fivetran_connector_sdk import Connector, Operations as op  # type: ignore[import-untyped]
+from fivetran_connector_sdk import Connector, Logging as log, Operations as op  # type: ignore[import-untyped]
 
 # Global variables to store configuration (set by get_configuration)
 _loop_client: Optional["LoopAPIClient"] = None
@@ -54,7 +54,7 @@ class LoopAPIClient:
 
     def get(self, url: str, **kwargs: Any) -> requests.Response:
         """
-        Make a GET request to the Loop API with retry logic.
+        Make a GET request to the Loop API with retry logic and rate limit handling.
 
         Args:
             url: Full URL or path relative to base URL
@@ -80,14 +80,81 @@ class LoopAPIClient:
         if "timeout" not in kwargs:
             kwargs["timeout"] = 30
 
+        # Extract page number from URL for better logging (if available)
+        page_info = ""
+        if "pageNo=" in url:
+            try:
+                page_num = url.split("pageNo=")[1].split("&")[0]
+                page_info = f" (page {page_num})"
+            except:
+                pass
+
+        rate_limited = False
         for attempt in range(max_retries):
             try:
                 response = requests.get(url, **kwargs)
 
                 # If successful or non-retryable error, return immediately
                 if response.status_code not in retryable_statuses:
+                    # If we had to retry due to rate limits, add extra delay after success, this helps prevent immediately hitting the limit again
+                    if rate_limited and attempt > 0:
+                        extra_delay = 2.0  # Add 2 seconds after recovering from rate limit
+                        log.info(f"Recovered from rate limit{page_info}. Waiting {extra_delay}s before continuing...")
+                        time.sleep(extra_delay)
+                    
+                    # Check for rate limit headers even on successful responses
+                    # Loop API returns X-RateLimit-Remaining header
+                    rate_limit_remaining = response.headers.get("X-RateLimit-Remaining")
+                    if rate_limit_remaining:
+                        try:
+                            remaining = int(rate_limit_remaining)
+                            # Adaptive rate limiting based on remaining requests
+                            if remaining == 0:
+                                # No remaining requests - wait longer to let bucket refill
+                                log.warning(f"Rate limit remaining: 0. Waiting 3s for bucket to refill...")
+                                time.sleep(3.0)
+                            elif remaining <= 1:
+                                # Very low - wait a bit
+                                log.warning(f"Rate limit remaining: {remaining}. Adding 2s delay.")
+                                time.sleep(2.0)
+                            elif remaining <= 3:
+                                # Low - add small delay
+                                log.info(f"Rate limit remaining: {remaining}. Adding 1s delay.")
+                                time.sleep(1.0)
+                            # If remaining > 3, no extra delay needed
+                        except (ValueError, TypeError):
+                            pass
                     return response
 
+                # Handle 429 rate limit with Retry-After header support
+                if response.status_code == 429:
+                    rate_limited = True
+                    # Check for Retry-After header (in seconds)
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            wait_time = int(retry_after)
+                            # Add a small buffer to the Retry-After time to be safe
+                            wait_time = max(wait_time, 2)  # Minimum 2 seconds
+                            log.warning(f"Rate limited{page_info}. Waiting {wait_time} seconds as specified by Retry-After header")
+                        except (ValueError, TypeError):
+                            # If Retry-After is invalid, use exponential backoff
+                            wait_time = min(2 ** (attempt + 2), 60)  # Cap at 60 seconds
+                    else:
+                        # No Retry-After header, use longer exponential backoff for rate limits
+                        wait_time = min(2 ** (attempt + 2), 60)  # Cap at 60 seconds
+                    
+                    # If last attempt, raise the error
+                    if attempt == max_retries - 1:
+                        log.severe(f"Rate limit exceeded{page_info} after {max_retries} attempts. Last wait time: {wait_time}s")
+                        response.raise_for_status()
+                        return response
+                    
+                    log.warning(f"Rate limited{page_info} - attempt {attempt + 1}/{max_retries}. Waiting {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    continue
+
+                # For other retryable errors (5xx), use standard exponential backoff
                 # If last attempt, raise the error
                 if attempt == max_retries - 1:
                     response.raise_for_status()
@@ -97,17 +164,39 @@ class LoopAPIClient:
                 wait_time = 2**attempt
                 time.sleep(wait_time)
 
-            except requests.RequestException:
+            except requests.RequestException as e:
                 # If last attempt, re-raise the exception
                 if attempt == max_retries - 1:
                     raise
 
                 # Exponential backoff: wait 2^attempt seconds
                 wait_time = 2**attempt
+                log.warning(f"Request failed (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {wait_time}s...")
                 time.sleep(wait_time)
 
         # Should never reach here, but just in case
         return requests.get(url, **kwargs)
+
+
+def validate_configuration(configuration: dict[str, Any]) -> None:
+    """
+    Validate the configuration dictionary to ensure it contains all required parameters.
+    
+    Args:
+        configuration: Dictionary holding configuration settings
+        
+    Raises:
+        ValueError: If any required configuration parameter is missing
+    """
+    api_token = str(
+        configuration.get("LOOP_API_TOKEN") or configuration.get("loop_api_token") or ""
+    )
+    if not api_token or api_token in ["your-loop-api-token-here", "test-token-123"]:
+        # For testing, allow placeholder tokens but warn
+        if api_token in ["your-loop-api-token-here", "test-token-123"]:
+            log.warning("Using placeholder API token. Real API calls will fail.")
+        else:
+            raise ValueError("LOOP_API_TOKEN is required in configuration")
 
 
 def _initialize_client(configuration: dict[str, Any]) -> None:
@@ -123,18 +212,14 @@ def _initialize_client(configuration: dict[str, Any]) -> None:
     if _loop_client is not None:
         return
 
+    # Validate configuration first
+    validate_configuration(configuration)
+
     # Configuration is flat, not nested under "secrets"
     # Get required configuration
     api_token = str(
         configuration.get("LOOP_API_TOKEN") or configuration.get("loop_api_token") or ""
     )
-    if not api_token or api_token in ["your-loop-api-token-here", "test-token-123"]:
-        # For testing, allow placeholder tokens but warn
-        if api_token in ["your-loop-api-token-here", "test-token-123"]:
-            print("Warning: Using placeholder API token. Real API calls will fail.")
-            api_token = api_token  # Keep the placeholder
-        else:
-            raise ValueError("LOOP_API_TOKEN is required in secrets")
 
     api_url = str(
         configuration.get("LOOP_API_URL")
@@ -183,7 +268,11 @@ def update(configuration: dict[str, Any], state: dict[str, Any]) -> dict[str, An
     Returns:
         Updated state dictionary
     """
+    log.info("Starting Loop connector sync")
     global _loop_client, _sync_window_days
+
+    # Validate configuration
+    validate_configuration(configuration)
 
     # Initialize client if not already done
     _initialize_client(configuration)
@@ -201,19 +290,34 @@ def update(configuration: dict[str, Any], state: dict[str, Any]) -> dict[str, An
     )
 
     # Calculate start date
-    if is_full_refresh:
-        # For full refresh, use epoch 0 to fetch all records
-        start_date = datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc)
-    else:
-        # For incremental sync, use the state's UpdatedSince or sync_window_days ago
-        if updated_since > 0:
-            start_date = datetime.datetime.fromtimestamp(
-                updated_since, tz=datetime.timezone.utc
-            )
-        else:
+    # Check for test mode: limit date range for testing (useful for debug mode)
+    test_days_back = configuration.get("TEST_DAYS_BACK")
+    if test_days_back:
+        # Test mode: only sync last N days
+        try:
+            test_days = int(test_days_back)
             start_date = datetime.datetime.now(
                 datetime.timezone.utc
-            ) - datetime.timedelta(days=_sync_window_days)
+            ) - datetime.timedelta(days=test_days)
+            log.info(f"TEST MODE: Limiting sync to last {test_days} days")
+        except (ValueError, TypeError):
+            # Invalid test_days_back, use normal logic
+            test_days_back = None
+    
+    if not test_days_back:
+        if is_full_refresh:
+            # For full refresh, use epoch 0 to fetch all records
+            start_date = datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc)
+        else:
+            # For incremental sync, use the state's UpdatedSince or sync_window_days ago
+            if updated_since > 0:
+                start_date = datetime.datetime.fromtimestamp(
+                    updated_since, tz=datetime.timezone.utc
+                )
+            else:
+                start_date = datetime.datetime.now(
+                    datetime.timezone.utc
+                ) - datetime.timedelta(days=_sync_window_days)
 
     # End date: Lambda uses current time + 24 hours to ensure we get all records
     end_date = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
@@ -222,23 +326,31 @@ def update(configuration: dict[str, Any], state: dict[str, Any]) -> dict[str, An
     start_epoch = int(start_date.timestamp())
     end_epoch = int(end_date.timestamp())
 
-    # Sync subscriptions
-    _sync_subscriptions(start_epoch, end_epoch)
+    try:
+        # Sync subscriptions
+        log.info(f"Syncing subscriptions from {start_date.isoformat()} to {end_date.isoformat()}")
+        _sync_subscriptions(start_epoch, end_epoch)
 
-    # Sync orders
-    _sync_orders(start_epoch, end_epoch)
+        # Sync orders
+        log.info(f"Syncing orders from {start_date.isoformat()} to {end_date.isoformat()}")
+        _sync_orders(start_epoch, end_epoch)
 
-    # Sync activities
-    _sync_activities(start_epoch, end_epoch)
+        # Sync activities
+        log.info(f"Syncing activities from {start_date.isoformat()} to {end_date.isoformat()}")
+        _sync_activities(start_epoch, end_epoch)
 
-    # Update state with current timestamp and sync_id
-    updated_state = {
-        "last_sync_timestamp": end_date.isoformat(),
-        "updated_since": int(start_date.timestamp()),
-        "sync_id": request_sync_id if request_sync_id else sync_id,
-    }
-    op.checkpoint(updated_state)
-    return updated_state
+        # Update state with current timestamp and sync_id
+        updated_state = {
+            "last_sync_timestamp": end_date.isoformat(),
+            "updated_since": int(start_date.timestamp()),
+            "sync_id": request_sync_id if request_sync_id else sync_id,
+        }
+        op.checkpoint(updated_state)
+        log.info("Sync completed successfully")
+        return updated_state
+    except Exception as e:
+        log.severe(f"Sync failed: {str(e)}")
+        raise RuntimeError(f"Failed to sync Loop data: {str(e)}")
 
 
 def _sync_subscriptions(start_epoch: int, end_epoch: int) -> None:
@@ -253,13 +365,33 @@ def _sync_subscriptions(start_epoch: int, end_epoch: int) -> None:
 
     page = 1
     has_more = True
+    consecutive_failures = 0
+    max_consecutive_failures = 3
 
     while has_more:
         # Call Loop API subscriptions endpoint with date filtering
         subscriptions = _get_subscriptions_page(page, start_epoch, end_epoch)
 
+        # If we get an empty response, check if it's a failure or truly no more data
         if not subscriptions:
-            break
+            # Check if we had a previous successful page to determine if there's more data
+            # If this is page 1 and it fails, we should stop
+            if page == 1:
+                log.warning("No data returned on first page. Stopping subscription sync.")
+                break
+            
+            consecutive_failures += 1
+            if consecutive_failures >= max_consecutive_failures:
+                log.warning(f"Too many consecutive failures ({consecutive_failures}). Stopping subscription sync.")
+                break
+            
+            # Wait a bit before retrying the same page
+            log.info(f"Empty response on page {page}. Waiting before continuing...")
+            time.sleep(5)
+            continue
+        
+        # Reset failure counter on success
+        consecutive_failures = 0
 
         subscriptions_data = []
         subscription_line_items_data = []
@@ -380,6 +512,11 @@ def _sync_subscriptions(start_epoch: int, end_epoch: int) -> None:
         # Check if there are more pages
         has_more = subscriptions.get("pageInfo", {}).get("hasNextPage", False)
         page += 1
+        
+        # Add a delay between pages to avoid hitting rate limits
+        # Loop API has strict rate limits (~2 requests per 2 seconds)
+        if has_more:
+            time.sleep(2.5)  # 2.5 second delay between pages to respect rate limits
 
 
 def _sync_orders(start_epoch: int, end_epoch: int) -> None:
@@ -392,13 +529,28 @@ def _sync_orders(start_epoch: int, end_epoch: int) -> None:
     """
     page = 1
     has_more = True
+    consecutive_failures = 0
+    max_consecutive_failures = 3
 
     while has_more:
         # Call Loop API orders endpoint with date filtering
         orders_response = _get_orders_page(page, start_epoch, end_epoch)
 
         if not orders_response:
-            break
+            if page == 1:
+                log.warning("No data returned on first page. Stopping orders sync.")
+                break
+            
+            consecutive_failures += 1
+            if consecutive_failures >= max_consecutive_failures:
+                log.warning(f"Too many consecutive failures ({consecutive_failures}). Stopping orders sync.")
+                break
+            
+            log.info(f"Empty response on page {page}. Waiting before continuing...")
+            time.sleep(5)
+            continue
+        
+        consecutive_failures = 0
 
         orders_data = []
 
@@ -452,6 +604,10 @@ def _sync_orders(start_epoch: int, end_epoch: int) -> None:
 
         has_more = orders_response.get("pageInfo", {}).get("hasNextPage", False)
         page += 1
+        
+        # Add a delay between pages to avoid hitting rate limits
+        if has_more:
+            time.sleep(2.5)  # 2.5 second delay between pages to respect rate limits
 
 
 def _sync_activities(start_epoch: int, end_epoch: int) -> None:
@@ -464,13 +620,28 @@ def _sync_activities(start_epoch: int, end_epoch: int) -> None:
     """
     page = 1
     has_more = True
+    consecutive_failures = 0
+    max_consecutive_failures = 3
 
     while has_more:
         # Call Loop API activities endpoint with date filtering
         activities_response = _get_activities_page(page, start_epoch, end_epoch)
 
         if not activities_response:
-            break
+            if page == 1:
+                log.warning("No data returned on first page. Stopping activities sync.")
+                break
+            
+            consecutive_failures += 1
+            if consecutive_failures >= max_consecutive_failures:
+                log.warning(f"Too many consecutive failures ({consecutive_failures}). Stopping activities sync.")
+                break
+            
+            log.info(f"Empty response on page {page}. Waiting before continuing...")
+            time.sleep(5)
+            continue
+        
+        consecutive_failures = 0
 
         activities_data = []
         for activity in activities_response.get("data", []):
@@ -519,6 +690,10 @@ def _sync_activities(start_epoch: int, end_epoch: int) -> None:
 
         has_more = activities_response.get("pageInfo", {}).get("hasNextPage", False)
         page += 1
+        
+        # Add a delay between pages to avoid hitting rate limits
+        if has_more:
+            time.sleep(2.5)  # 2.5 second delay between pages to respect rate limits
 
 
 def _parse_timestamp(timestamp_str: Optional[str]) -> Optional[str]:
@@ -606,53 +781,32 @@ def _get_api_page(
         date_param_prefix: Prefix for date parameters ("updatedAt" or "createdAt")
 
     Returns:
-        Response dictionary with data and pageInfo
+        Response dictionary with data and pageInfo, or empty dict on failure
     """
     global _loop_client
 
     if _loop_client is None:
         return {}
 
-    url = f"{endpoint}?pageNo={page}&pageSize=1000&{date_param_prefix}StartEpoch={start_epoch}&{date_param_prefix}EndEpoch={end_epoch}"
-    max_retries = 3
-    
-    for attempt in range(max_retries):
-        try:
-            response = _loop_client.get(url, timeout=30)
-            
-            # Handle 429 rate limiting with retry
-            if response.status_code == 429:
-                if attempt < max_retries - 1:
-                    # Wait about a second before retrying
-                    time.sleep(1.0)
-                    continue
-                else:
-                    # Last attempt, log and return empty
-                    print(f"Rate limited (429) fetching {endpoint} page {page} after {max_retries} attempts")
-                    return {}
-            
-            response.raise_for_status()
-            result: dict[str, Any] = response.json()  # type: ignore[assignment]
-            return result
-        except requests.HTTPError as e:
-            # Check if it's a 429 error from raise_for_status()
-            if hasattr(e, 'response') and e.response is not None and e.response.status_code == 429:
-                if attempt < max_retries - 1:
-                    time.sleep(1.0)
-                    continue
-                else:
-                    print(f"Rate limited (429) fetching {endpoint} page {page} after {max_retries} attempts")
-                    return {}
-            # For other HTTP errors, log and return empty
-            print(f"Error fetching {endpoint} page {page}: {e}")
-            return {}
-        except Exception as e:
-            # Log error but don't fail the entire sync
-            print(f"Error fetching {endpoint} page {page}: {e}")
-            return {}
-    
-    # Should never reach here, but return empty dict as fallback
-    return {}
+    try:
+        url = f"{endpoint}?pageNo={page}&pageSize=1000&{date_param_prefix}StartEpoch={start_epoch}&{date_param_prefix}EndEpoch={end_epoch}"
+        log.info(f"Fetching {endpoint} page {page}...")
+        response = _loop_client.get(url, timeout=30)
+        response.raise_for_status()
+        result: dict[str, Any] = response.json()  # type: ignore[assignment]
+        log.info(f"Successfully fetched {endpoint} page {page}")
+        return result
+    except requests.HTTPError as e:
+        # For HTTP errors (like 429), log and return empty to allow continuation
+        if e.response and e.response.status_code == 429:
+            log.warning(f"Rate limit hit on {endpoint} page {page} after retries. Will retry on next sync.")
+        else:
+            log.warning(f"HTTP error fetching {endpoint} page {page}: {e}")
+        return {}
+    except Exception as e:
+        # Log error but don't fail the entire sync
+        log.warning(f"Error fetching {endpoint} page {page}: {e}")
+        return {}
 
 
 def _get_subscriptions_page(
